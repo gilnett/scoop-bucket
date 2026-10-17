@@ -2,18 +2,123 @@ name: Excavator
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */4 * * *'
+    inputs:
+      force:
+        description: 'Force update even if version is current'
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [wstrace_release, release, package_update]
+
+permissions:
+  contents: write
 
 jobs:
   excavate:
-    name: Excavator
+    name: Check & Update Manifests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Run Scoop Excavator
-        uses: ScoopInstaller/GithubActions@main
+      - name: Check and Update wstrace Manifest
+        id: update_manifest
+        shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SKIP_UPDATED: '1'
+          FORCE_UPDATE: ${{ inputs.force }}
+        run: |
+          $manifestPath = "bucket/wstrace.json"
+          if (-not (Test-Path $manifestPath)) {
+            Write-Error "Manifest not found at $manifestPath"
+            exit 1
+          }
+
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $currentVersion = $manifest.version
+
+          $headers = @{
+            "Accept" = "application/vnd.github.v3+json"
+            "User-Agent" = "scoop-excavator"
+          }
+          if ($env:GITHUB_TOKEN) {
+            $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+          }
+
+          Write-Host "Fetching latest release from gilnett/wstrace..."
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/gilnett/wstrace/releases/latest" -Headers $headers
+          $tag = $release.tag_name
+          $latestVersion = $tag -replace '^v',''
+
+          Write-Host "Current manifest version : $currentVersion"
+          Write-Host "Latest upstream version  : $latestVersion ($tag)"
+
+          $isForce = ("$env:FORCE_UPDATE" -eq "true")
+
+          if ($latestVersion -eq $currentVersion -and -not $isForce) {
+            Write-Host "wstrace is already up to date ($currentVersion). No update needed."
+            exit 0
+          }
+
+          Write-Host "New version detected ($latestVersion) or force requested. Updating manifest..."
+
+          $checksumsAsset = $release.assets | Where-Object { $_.name -eq "SHA256SUMS.txt" }
+          if (-not $checksumsAsset) {
+            Write-Error "SHA256SUMS.txt asset not found in release $tag"
+            exit 1
+          }
+
+          $checksumsContent = Invoke-RestMethod -Uri $checksumsAsset.browser_download_url
+          Write-Host "Retrieved checksums:"
+          Write-Host $checksumsContent
+
+          $hashX86 = $null
+          $hashArm64 = $null
+
+          foreach ($line in ($checksumsContent -split "`r?`n")) {
+            if ($line -match '^([a-fA-F0-9]{64})\s+.*windows-x86_64\.zip$') {
+              $hashX86 = $matches[1].ToLower()
+            } elseif ($line -match '^([a-fA-F0-9]{64})\s+.*windows-aarch64\.zip$') {
+              $hashArm64 = $matches[1].ToLower()
+            }
+          }
+
+          if (-not $hashX86) {
+            Write-Error "Could not resolve x86_64 hash from SHA256SUMS.txt"
+            exit 1
+          }
+          if (-not $hashArm64) {
+            Write-Error "Could not resolve arm64 hash from SHA256SUMS.txt"
+            exit 1
+          }
+
+          $manifest.version = $latestVersion
+          $manifest.architecture.'64bit'.url = "https://github.com/gilnett/wstrace/releases/download/$tag/wstrace-$tag-windows-x86_64.zip"
+          $manifest.architecture.'64bit'.hash = $hashX86
+          $manifest.architecture.arm64.url = "https://github.com/gilnett/wstrace/releases/download/$tag/wstrace-$tag-windows-aarch64.zip"
+          $manifest.architecture.arm64.hash = $hashArm64
+
+          $json = $manifest | ConvertTo-Json -Depth 10
+          Set-Content -Path $manifestPath -Value $json -Encoding utf8
+
+          Write-Host "Updated $manifestPath successfully for version $latestVersion."
+
+      - name: Commit and Push Changes
+        shell: pwsh
+        run: |
+          $status = git status --porcelain
+          if ($status) {
+            $manifest = Get-Content "bucket/wstrace.json" -Raw | ConvertFrom-Json
+            $version = $manifest.version
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add bucket/wstrace.json
+            git commit -m "ci(manifest): update wstrace to v$version [skip ci]"
+            git push origin main
+            Write-Host "Successfully pushed manifest update for v$version."
+          } else {
+            Write-Host "No changes detected to commit."
+          }

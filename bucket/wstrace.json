@@ -23,6 +23,9 @@
             "arm64": {
                 "url": "https://github.com/gilnett/wstrace/releases/download/v$version/wstrace-v$version-windows-aarch64.zip"
             }
+        },
+        "hash": {
+            "url": "$baseurl/SHA256SUMS.txt"
         }
     }
 }
